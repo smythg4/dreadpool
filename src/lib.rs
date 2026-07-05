@@ -1,5 +1,4 @@
-use crossbeam::deque::{Steal, Stealer, Worker};
-use crossbeam::queue::SegQueue;
+use crossbeam::deque::{Injector, Steal, Stealer, Worker};
 use std::{
     sync::atomic::AtomicBool,
     sync::atomic::Ordering,
@@ -9,36 +8,38 @@ use std::{
 
 type Task = Box<dyn FnOnce() + Send>;
 
-const IDEAL_WORKER_BACKLOG: usize = 8;
-const BATCH_GRAB_COUNT: usize = IDEAL_WORKER_BACKLOG / 2;
+const IDEAL_WORKER_BACKLOG: usize = 10; // 10 is completely arbitrary
 
 struct WorkerContext {
-    global: Arc<SegQueue<Task>>,
+    name: Option<String>,
+    global: Arc<Injector<Task>>,
     worker: Worker<Task>,
     stealers: Arc<Vec<Stealer<Task>>>,
-    index: usize, // so a worker skips stealing from itself
+    id: usize, // so a worker skips stealing from itself
     shutdown: Arc<AtomicBool>,
-    mcv: Arc<(Condvar, Mutex<()>)>, // Mutex guards a value that indicates the number of pending tasks for processing.
+    mcv: Arc<(Condvar, Mutex<()>)>,
+    stack_size: Option<usize>,
 }
 
 fn worker_loop(ctx: WorkerContext) {
-    let id = ctx.index;
+    let id = ctx.id;
     loop {
-        // top off the local queue with global queue values
-        if !ctx.global.is_empty() && ctx.worker.len() < IDEAL_WORKER_BACKLOG {
-            let mut count = 0;
-            for _ in 0..BATCH_GRAB_COUNT {
-                if let Some(task) = ctx.global.pop() {
-                    ctx.worker.push(task);
-                    count += 1;
-                }
+        let to_grab = IDEAL_WORKER_BACKLOG.saturating_sub(ctx.worker.len());
+        match ctx
+            .global
+            .steal_batch_with_limit_and_pop(&ctx.worker, to_grab)
+        {
+            Steal::Success(task) => {
+                println!("[{id}] running a task from the GLOBAL queue");
+                task();
+                continue;
             }
-            println!("[{id}] pulled {count} tasks from the GLOBAL queue into its LOCAL queue");
-        }
+            Steal::Retry | Steal::Empty => {}
+        };
 
         // drain local queue first
         if let Some(task) = ctx.worker.pop() {
-            println!("[{id}] pulling a task from its LOCAL queue");
+            println!("[{id}] running a task from its LOCAL queue");
             task();
             continue;
         }
@@ -86,15 +87,52 @@ fn worker_loop(ctx: WorkerContext) {
 }
 
 pub struct ThreadPool {
-    global: Arc<SegQueue<Task>>,    // the global queue of work to do
+    global: Arc<Injector<Task>>,    // the global queue of work to do
     shutdown: Arc<AtomicBool>,      // a global signal that the threadpool is shutting down
     mcv: Arc<(Condvar, Mutex<()>)>, // signal used for sleeping and waking threads in the pool
     workers: Vec<JoinHandle<()>>,
 }
 
-impl ThreadPool {
-    pub fn new(num_workers: usize) -> Self {
-        let global = Arc::new(SegQueue::default());
+#[derive(Default, Clone)]
+struct ThreadPoolBuilder {
+    num_threads: Option<usize>,
+    thread_name: Option<String>,
+    thread_stack_size: Option<usize>,
+}
+
+impl ThreadPoolBuilder {
+    pub fn with_threads(mut self, num_threads: usize) -> Self {
+        self.num_threads = Some(num_threads);
+        self
+    }
+
+    pub fn with_thread_name<S: Into<String>>(mut self, name: S) -> Self {
+        self.thread_name = Some(name.into());
+        self
+    }
+
+    pub fn with_stack_size(mut self, stack_size: usize) -> Self {
+        self.thread_stack_size = Some(stack_size);
+        self
+    }
+
+    fn spawn_in_pool(ctx: WorkerContext) -> thread::JoinHandle<()> {
+        let mut builder = thread::Builder::new();
+        if let Some(ref name) = ctx.name {
+            builder = builder.name(name.clone());
+        }
+        if let Some(ref stack_size) = ctx.stack_size {
+            builder = builder.stack_size(*stack_size);
+        }
+        builder
+            .spawn(move || worker_loop(ctx))
+            .expect("failed to spawn a fresh thread")
+    }
+
+    pub fn build(self) -> ThreadPool {
+        let global = Arc::new(Injector::default());
+
+        let num_workers = self.num_threads.unwrap_or_else(num_cpus::get);
         let mut worker_threads = Vec::with_capacity(num_workers);
 
         // Generate workers list
@@ -102,7 +140,6 @@ impl ThreadPool {
             .map(|_| Worker::<Task>::new_fifo())
             .collect();
         let stealers: Arc<Vec<_>> = Arc::new(workers.iter().map(|w| w.stealer()).collect());
-
         // Generate Condvar construct
         let mcv = Arc::new((Condvar::new(), Mutex::new(())));
         // Generate shutdown signal
@@ -115,21 +152,26 @@ impl ThreadPool {
                 global: Arc::clone(&global),
                 worker,
                 stealers: Arc::clone(&stealers),
-                index: i,
+                id: i,
                 shutdown: Arc::clone(&shutdown),
                 mcv: Arc::clone(&mcv),
+                stack_size: self.thread_stack_size,
+                name: self.thread_name.clone(),
             };
-            let handle = thread::spawn(move || worker_loop(ctx));
+
+            let handle = Self::spawn_in_pool(ctx);
             worker_threads.push(handle);
         }
-        Self {
+        ThreadPool {
             global,
             shutdown,
             mcv,
             workers: worker_threads,
         }
     }
+}
 
+impl ThreadPool {
     pub fn spawn(&self, f: impl FnOnce() + Send + 'static) {
         let _guard = self.mcv.1.lock().unwrap();
         self.global.push(Box::new(f));
@@ -153,10 +195,6 @@ impl Drop for ThreadPool {
     }
 }
 
-fn main() {
-    println!("Run the test...");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,15 +204,22 @@ mod tests {
     #[test]
     fn test_tasks_execute() {
         let num_threads = 5;
-        let max_wait = 50;
+        let stack_size = 2048; // 2 KB thread stacks
+        let max_wait = 50; // measured in ms
+
         let random_task = move |counter: Arc<Mutex<usize>>| {
             let rand = rand::random_range(0..=max_wait);
             std::thread::sleep(Duration::from_millis(rand));
             let mut n = counter.lock().unwrap();
             *n += 1;
         };
-        let expected = 100;
-        let pool = ThreadPool::new(num_threads);
+        let expected = 10;
+        let pool = ThreadPoolBuilder::default()
+            .with_threads(num_threads)
+            .with_stack_size(stack_size)
+            .with_thread_name("test pool")
+            .build();
+
         let counter = Arc::new(Mutex::new(0));
         let start = std::time::Instant::now();
         for _ in 0..expected {
@@ -185,7 +230,7 @@ mod tests {
         let elapsed = start.elapsed();
         println!(
             "Took {elapsed:?} to complete compared to the max sequential time of {} ms",
-            num_threads as u64 * max_wait
+            expected as u64 * max_wait
         );
         assert_eq!(*counter.lock().unwrap(), expected);
     }
