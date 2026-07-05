@@ -15,45 +15,28 @@ Here's the idea:
     * If there's nothing on the local queue, it will steal a batch of `Tasks` from the first available other worker local queue.
     * If there's no work on anyone's queue, the worker checks a global flag to indicate whether it's time to shutdown.
     * If it's not time to shutdown, the worker thread goes to sleep. It will be notified to wake up by a call to `threadpool::spawn`.
+
 ## `WorkerContext`
-Each thread is passed a custom struct called `WorkerContext`, defined here:
+Each thread is passed a `WorkerContext` containing everything it needs to operate independently:
 ```
 struct WorkerContext {
     name: Option<String>,
     global: Arc<Injector<Task>>,
     worker: Worker<Task>,
     stealers: Arc<Vec<Stealer<Task>>>,
-    id: usize, // so a worker skips stealing from itself
+    id: usize,
     shutdown: Arc<AtomicBool>,
     mcv: Arc<(Condvar, Mutex<()>)>,
     stack_size: Option<usize>,
 }
 ```
-### `name`
-If elected during the `ThreadPool` building process, users are able to specify a name for the pool that can be used for logging purposes.
-
-### `global`
-The shared global queue from which a worker thread can pull `Task`s.
-
-### `worker`
-The local queue for this worker thread.
-
-### `stealers`
-Sneaky backdoors to all the other threads' `Worker` queues.
-
-### `id`
-Used for logging and to make sure we don't steal from our own local queue
-
-### `shutdown`
-An `AtomicBool` set by the `ThreadPool` (initially to `false`). When the `ThreadPool` `drop`s, this is set to `true` and triggers the workers to finish up what's left in all the `Task` queues and terminate.
-
-### `mcv`
-A tuple holding a `CondVar` and a `Mutex`. This is used for worker threads to sleep if they can't find work to do in any queue *and* the `shutdown` flag isn't active.
-
-The `ThreadPool` will use the `CondVar` to `notify_one` on each call to `spawn`, waking up a thread that was waiting for work.
-
-### `stack_size`
-If elected during the `ThreadPool` building process, users are able to specify the desired size of the thread stack.
+- **`global`** — the shared global queue from which a worker thread can pull `Task`s
+- **`worker`** — the local queue owned by this worker thread
+- **`stealers`** — sneaky backdoors to all the other threads' `Worker` queues
+- **`shutdown`** — an `AtomicBool` set to `true` when the `ThreadPool` drops, signaling workers to
+drain remaining tasks and terminate
+- **`mcv`** — a `(Condvar, Mutex<()>)` pair used to sleep idle workers and wake them on `spawn`
+- **`name`** / **`stack_size`** — optional configuration set during the build phase
 
 ## Required Equipment
 [`crossbeam::deque`](https://docs.rs/crossbeam/latest/crossbeam/deque/index.html) gives us some nifty tools to tackle this challenge. This `deque` comes in three flavors for us: `Injector`, `Worker`, and `Stealer`.
@@ -72,17 +55,21 @@ But what happens when a worker thread's local queue is empty?
 ### The Secret Sauce - `crossbeam::deque::Stealer`
 Before we spawn our threads, we make a series of `Worker` queues
 ```
-        let workers: Vec<_> = (0..num_workers)
-            .map(|_| Worker::<Task>::new_fifo())
-            .collect();
+    let workers: Vec<_> = (0..num_workers)
+        .map(|_| Worker::<Task>::new_fifo())
+        .collect();
 ```
 
 `Worker` has a method called `stealer()` that creates a `Stealer` queue that can be shared across threads and cloned.
 ```
-        let stealers: Arc<Vec<_>> = Arc::new(workers.iter().map(|w| w.stealer()).collect());
+    let stealers: Arc<Vec<_>> = Arc::new(
+        workers.iter()
+                .map(|w| w.stealer())
+                .collect()
+        );
 ```
 
-Each worker thread is spawned with its own, owned `Worker` queue, as well as a list of `Stealer` queues so it can steal for all its friends.
+Each worker thread is spawned with its own, owned `Worker` queue, as well as a list of `Stealer` queues so it can steal from all its friends.
 
 If both the global and local queue are empty, the worker will check the list of `Stealers` and call `steal_batch_and_pop`, similar to the call the global queue, but without a fixed limit. It will transfer roughly half of the other thread's `Worker` queue into our local queue, popping one off for immediate handling in the process.
 

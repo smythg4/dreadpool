@@ -139,7 +139,11 @@ impl ThreadPoolBuilder {
         let workers: Vec<_> = (0..num_workers)
             .map(|_| Worker::<Task>::new_fifo())
             .collect();
-        let stealers: Arc<Vec<_>> = Arc::new(workers.iter().map(|w| w.stealer()).collect());
+        let stealers: Arc<Vec<_>> = Arc::new(
+            workers.iter()
+                    .map(|w| w.stealer())
+                    .collect()
+                );
         // Generate Condvar construct
         let mcv = Arc::new((Condvar::new(), Mutex::new(())));
         // Generate shutdown signal
