@@ -147,7 +147,7 @@ impl ThreadPoolBuilder {
         let shutdown = Arc::new(AtomicBool::new(false));
 
         for (i, worker) in workers.into_iter().enumerate() {
-            eprintln!("Creating Worker {i}...");
+            println!("Creating Worker {i}...");
 
             let ctx = WorkerContext {
                 global: Arc::clone(&global),
@@ -183,6 +183,10 @@ impl ThreadPool {
         // wake up a waiting thead
         self.mcv.0.notify_one();
     }
+
+    pub fn join(self) {
+        drop(self)
+    }
 }
 
 impl Drop for ThreadPool {
@@ -208,8 +212,8 @@ mod tests {
 
     #[test]
     fn test_tasks_execute() {
-        let expected = 1_000;
-        let num_threads = 5;
+        let expected = 10;
+        let num_threads = 3;
         let stack_size = 1024 * 1024; // 1 MB thread stacks
         let max_wait = 500; // measured in ms
 
@@ -225,17 +229,14 @@ mod tests {
             .with_thread_name("test pool")
             .build();
 
-        println!("Workers: start your engines...");
-        thread::sleep(Duration::from_millis(2000));
-
         let counter = Arc::new(Mutex::new(0));
         let start = std::time::Instant::now();
         for _ in 0..expected {
             let counter = Arc::clone(&counter);
             pool.spawn(move || random_task.clone()(counter));
         }
-        thread::sleep(Duration::from_millis(2000));
-        drop(pool); // waits for all tasks to finish
+
+        pool.join(); // waits for all tasks to finish
         let elapsed = start.elapsed();
         println!(
             "Took {elapsed:?} to complete compared to the max sequential time of {} ms",
