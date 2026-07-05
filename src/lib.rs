@@ -8,7 +8,7 @@ use std::{
 
 type Task = Box<dyn FnOnce() + Send>;
 
-const IDEAL_WORKER_BACKLOG: usize = 10; // 10 is completely arbitrary
+const IDEAL_WORKER_BACKLOG: usize = 10; // completely arbitrary choice
 
 struct WorkerContext {
     name: Option<String>,
@@ -34,7 +34,8 @@ fn worker_loop(ctx: WorkerContext) {
                 task();
                 continue;
             }
-            Steal::Retry | Steal::Empty => {}
+            Steal::Retry => continue, // let's try once more
+            Steal::Empty => {}
         };
 
         // drain local queue first
@@ -94,7 +95,7 @@ pub struct ThreadPool {
 }
 
 #[derive(Default, Clone)]
-struct ThreadPoolBuilder {
+pub struct ThreadPoolBuilder {
     num_threads: Option<usize>,
     thread_name: Option<String>,
     thread_stack_size: Option<usize>,
@@ -139,11 +140,7 @@ impl ThreadPoolBuilder {
         let workers: Vec<_> = (0..num_workers)
             .map(|_| Worker::<Task>::new_fifo())
             .collect();
-        let stealers: Arc<Vec<_>> = Arc::new(
-            workers.iter()
-                    .map(|w| w.stealer())
-                    .collect()
-                );
+        let stealers: Arc<Vec<_>> = Arc::new(workers.iter().map(|w| w.stealer()).collect());
         // Generate Condvar construct
         let mcv = Arc::new((Condvar::new(), Mutex::new(())));
         // Generate shutdown signal
@@ -176,6 +173,10 @@ impl ThreadPoolBuilder {
 }
 
 impl ThreadPool {
+    pub fn builder() -> ThreadPoolBuilder {
+        ThreadPoolBuilder::default()
+    }
+
     pub fn spawn(&self, f: impl FnOnce() + Send + 'static) {
         let _guard = self.mcv.1.lock().unwrap();
         self.global.push(Box::new(f));
@@ -207,22 +208,25 @@ mod tests {
 
     #[test]
     fn test_tasks_execute() {
+        let expected = 1_000;
         let num_threads = 5;
-        let stack_size = 2048; // 2 KB thread stacks
-        let max_wait = 50; // measured in ms
+        let stack_size = 1024 * 1024; // 1 MB thread stacks
+        let max_wait = 500; // measured in ms
 
         let random_task = move |counter: Arc<Mutex<usize>>| {
             let rand = rand::random_range(0..=max_wait);
-            std::thread::sleep(Duration::from_millis(rand));
+            thread::sleep(Duration::from_millis(rand));
             let mut n = counter.lock().unwrap();
             *n += 1;
         };
-        let expected = 10;
         let pool = ThreadPoolBuilder::default()
             .with_threads(num_threads)
             .with_stack_size(stack_size)
             .with_thread_name("test pool")
             .build();
+
+        println!("Workers: start your engines...");
+        thread::sleep(Duration::from_millis(2000));
 
         let counter = Arc::new(Mutex::new(0));
         let start = std::time::Instant::now();
@@ -230,6 +234,7 @@ mod tests {
             let counter = Arc::clone(&counter);
             pool.spawn(move || random_task.clone()(counter));
         }
+        thread::sleep(Duration::from_millis(2000));
         drop(pool); // waits for all tasks to finish
         let elapsed = start.elapsed();
         println!(

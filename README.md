@@ -8,15 +8,28 @@ This is a learning project to explore how work-stealing threadpools work in Rust
 This project depends heavily on the excellent [`crossbeam`](https://docs.rs/crossbeam/latest/crossbeam/) crate. Specifically leveraging [`Deque`](https://docs.rs/crossbeam/latest/crossbeam/deque/index.html).
 
 Here's the idea:
-1. `threadpool::spawn` serves as a central dispatcher and pushes new `Task`s onto a global queue
+1. `ThreadPool::spawn` serves as a central dispatcher and pushes new `Task`s onto a global queue
 2. Worker threads each maintain a local queue of `Task`s. They loop in the following order:
     * Top off the local queue to a target size by pulling off the global queue
     * Pull a `Task` off the local queue and run it.
     * If there's nothing on the local queue, it will steal a batch of `Tasks` from the first available other worker local queue.
     * If there's no work on anyone's queue, the worker checks a global flag to indicate whether it's time to shutdown.
-    * If it's not time to shutdown, the worker thread goes to sleep. It will be notified to wake up by a call to `threadpool::spawn`.
+    * If it's not time to shutdown, the worker thread goes to sleep. It will be notified to wake up by a call to `ThreadPool::spawn`.
 
-## `WorkerContext`
+### The `Task` Type
+Our unit of work is the `Task`, defined as:
+```
+type Task = Box<dyn FnOnce() + Send>;
+```
+`FnOnce` covers any closure that can be called exactly once — the natural fit for a unit of work
+that runs and completes. `Send` is required since tasks will cross thread boundaries. We wrap it in
+`Box` because trait objects are unsized and need a fixed-size pointer to be stored and passed
+around.
+
+Callers are required to pass `'static` closures to `spawn`, meaning closures must own their captures
+rather than borrow from the caller's stack — the compiler enforces this at the call site.
+
+### `WorkerContext`
 Each thread is passed a `WorkerContext` containing everything it needs to operate independently:
 ```
 struct WorkerContext {
@@ -52,6 +65,7 @@ We use the FIFO variety of `Worker`, which is owned by a single thread, but othe
 You'll notice that we essentially have a race between workers to gobble up work from the global queue, then start working on their local queues.
 
 But what happens when a worker thread's local queue is empty?
+
 ### The Secret Sauce - `crossbeam::deque::Stealer`
 Before we spawn our threads, we make a series of `Worker` queues
 ```
@@ -69,13 +83,38 @@ Before we spawn our threads, we make a series of `Worker` queues
         );
 ```
 
-Each worker thread is spawned with its own, owned `Worker` queue, as well as a list of `Stealer` queues so it can steal from all its friends.
+Each worker thread is spawned with its own, owned `Worker` queue, as well as a list of `Stealer` queues so it can steal from all its friends. Tasks are stolen from the end opposite to where they get pushed.
 
 If both the global and local queue are empty, the worker will check the list of `Stealers` and call `steal_batch_and_pop`, similar to the call the global queue, but without a fixed limit. It will transfer roughly half of the other thread's `Worker` queue into our local queue, popping one off for immediate handling in the process.
 
+## Getting Started
+```
+use dreadpool::ThreadPoolBuilder;
+use std::sync::{Arc, Mutex};
+
+fn main() {
+    let pool = ThreadPoolBuilder::default()
+        .with_threads(4)
+        .with_thread_name("dreadpool-worker")
+        .build();
+
+    let counter = Arc::new(Mutex::new(0));
+
+    for _ in 0..100 {
+        let counter = Arc::clone(&counter);
+        pool.spawn(move || {
+            let mut n = counter.lock().unwrap();
+            *n += 1;
+        });
+    }
+
+    drop(pool); // blocks until all tasks complete
+
+    println!("Final count: {}", *counter.lock().unwrap()); // 100
+}
+```
 ## Todo
 * Add capacity to detect thread panics and add a new thread to the pool in that event
-* Beef up this README by explaining thread safety concerns and the `Task` type.
 * Add examples to README
 * Add doc comments to project
 * A README section about my "lost wakeup" adventure
