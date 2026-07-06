@@ -305,14 +305,17 @@ mod tests {
 
     #[test]
     fn test_tasks_execute() {
-        let expected = 10;
+        let expected = 100;
         let num_threads = 3;
         let stack_size = 1024 * 1024; // 1 MB thread stacks
-        let max_wait = 500; // measured in ms
+        let long_wait = 2000; // measured in ms
+        let normal_wait = 50; // measured in ms
 
         let random_task = move |counter: Arc<Mutex<usize>>| {
-            let rand = rand::random_range(0..=max_wait);
-            thread::sleep(Duration::from_millis(rand));
+            match rand::random_range(0..=4) {
+                4 => thread::sleep(Duration::from_millis(long_wait)),
+                _ => thread::sleep(Duration::from_millis(normal_wait)),
+            };
             let mut n = counter.lock().unwrap();
             *n += 1;
         };
@@ -331,9 +334,12 @@ mod tests {
 
         pool.join(); // waits for all tasks to finish
         let elapsed = start.elapsed();
+        let short_wait = normal_wait * 3 / 4;
+        let long_wait = long_wait * 1 / 4;
+        let avg_wait = short_wait + long_wait;
         println!(
-            "Took {elapsed:?} to complete compared to the max sequential time of {} ms",
-            expected as u64 * max_wait
+            "Took {elapsed:?} to complete compared to the sequential time of {} ms",
+            expected as u64 * avg_wait
         );
         assert_eq!(*counter.lock().unwrap(), expected);
     }
