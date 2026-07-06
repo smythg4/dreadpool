@@ -72,6 +72,7 @@ struct WorkerContext {
     shutdown: Arc<AtomicBool>,
     mcv: Arc<(Condvar, Mutex<()>)>,
     stack_size: Option<usize>,
+    threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 ```
 - **`global`** — the shared global queue from which a worker thread can pull `Task`s (see below)
@@ -80,7 +81,44 @@ struct WorkerContext {
 - **`shutdown`** — an `AtomicBool` set to `true` when the `ThreadPool` drops, signaling workers to
 drain remaining tasks and terminate
 - **`mcv`** — a `(Condvar, Mutex<()>)` pair used to sleep idle workers and wake them on `spawn`
+- **`threads`** - janky glue to enable thread replacement 
 - **`name`** / **`stack_size`** — optional configuration set during the build phase
+
+### Thread Replacement
+Admittedly this approach has some drawbacks, but bear with me. This system spins up a fixed number of threads to which `Task`s get dispatched. I thought to myself "What happens if a thread panics?", we lose that worker capacity. In an effort to address that, Rust offers a slick way to handle it:
+```
+impl Drop for WorkerContext {
+    fn drop(&mut self) {
+        if panicking() {
+              let replacement = Worker::new_fifo();
+              // drain surviving tasks back into the replacement worker
+              while let Some(task) = self.worker.pop() {
+                  replacement.push(task);
+              }
+              let ctx = WorkerContext {
+                  global: Arc::clone(&self.global),
+                  worker: replacement,
+                  stealers: Arc::clone(&self.stealers),
+                  ...
+              };
+              ThreadPoolBuilder::spawn_in_pool(ctx);
+        }
+    }
+}
+```
+We can configure our implementation of `Drop` for `WorkerContext`. If a thread panics, it's going to drop the `WorkerContext` that was passed to it. A drop could be totally benign for example if the `ThreadPool` has shutdown, but we can use `std::thread::panicking` to see if this drop was the result of a panic.
+
+If so, we can quickly set up a replacement worker thread by doing the following:
+1. Create a new `Worker` queue and drain the remaining elements in the current one.
+2. Copy all the other data from the old context into a fresh one
+3. Spin up a new worker thread with this context.
+
+- **Jank Glue** - I had to add an `Arc<Mutex<Vec<JoinHandle<()>>>>` to the `WorkerContext` to get this to work. There's definitely a better way, but this gets the job done and contention should be minimal. The lock is only taken in `spawn_in_pool` and `ThreadPool::drop`.
+
+You may notice another problem here. We didn't append to the `stealers` queue. Our new thread will be able to steal from others, but nobody will be able to steal from it. Because we hold `stealers` in a normal `Vec`, it's immutable. There are a few possibilities for addressing this:
+
+1. Accept the limitation (what I chose to do)
+2. Protect `stealers` with a `RwLock`. This comes with the risk of high-contention and cache coherency slow down.
 
 ## Required Equipment
 [`crossbeam::deque`](https://docs.rs/crossbeam/latest/crossbeam/deque/index.html) gives us some nifty tools to tackle this challenge. This `deque` comes in three flavors for us: `Injector`, `Worker`, and `Stealer`.
@@ -88,7 +126,7 @@ drain remaining tasks and terminate
 ### The Global Queue - `crossbeam::deque::Injector`
 This FIFO queue serves as our main entry point for `Task` scheduling. When a caller calls `ThreadPool::spawn(t)` where `t` is of type `impl FnOnce() + Send + 'static`, `spawn` puts it in a `Box` (making it a `Task`) and pushes it onto the global queue. `Send` is required since these tasks will likely move between threads. `'static` is required since we need to assure the compiler that our data will outlive the thread's lifetime.
 
-In the worker thread, we run an infinite loop that start each iteration by comparing its current local `Task` queue size to a pre-defined ideal backlog size. If it doesn't have a sufficient backlog, we call `steal_batch_with_limit_and_pop` on the global queue. This will remove roughly half of the global queue's `Task`s but no more than the limit we provide it (which we calculate to the be the difference between the current queue length and the ideal). This method also usefully `pop`s the first element off to give us a `Task` to work on right away.
+In the worker thread, we run an infinite loop that starts each iteration by comparing its current local `Task` queue size to a pre-defined ideal backlog size. If it doesn't have a sufficient backlog, we call `steal_batch_with_limit_and_pop` on the global queue. This will remove roughly half of the global queue's `Task`s but no more than the limit we provide it (which we calculate to the be the difference between the current queue length and the ideal). This method also usefully `pop`s the first element off to give us a `Task` to work on right away.
 
 ### The Local Queues - `crossbeam::deque::Worker`
 We use the FIFO variety of `Worker`, which is owned by a single thread, but other threads may steal from it (more on that later). In the worker thread loop, assuming we have a sufficient local backlog we pull the first `Task` off the local queue and run it.
@@ -118,8 +156,8 @@ Each worker thread is spawned with its own, owned `Worker` queue, as well as a l
 
 If both the global and local queue are empty, the worker will check the list of `Stealers` and call `steal_batch_and_pop`, similar to the call the global queue, but without a fixed limit. It will transfer roughly half of the other thread's `Worker` queue into our local queue, popping one off for immediate handling in the process.
 
-## Lesson Learning - The Lost Wakeup
-When I initially wrote this, the workers spun in busy loops constantly looking for work until they were told to shutdown. In an effort to increase efficiency and all threads to go to sleep, I added the `mcv` construct to the `WorkerContext`.
+## Lesson Learned - The Lost Wakeup
+When I initially wrote this, the workers spun in busy loops constantly looking for work until they were told to shutdown. In an effort to increase efficiency and allow threads to go to sleep, I added the `mcv` construct to the `WorkerContext`.
 
 It had been a minute since I'd used `CondVar`s, and wrote my sleep logic in `worker_loop` like this:
 ```
@@ -170,5 +208,8 @@ We hold the `Mutex` guard across the global queue and `shutdown` checks to preve
 This issue also applied to `ThreadPool`'s `Drop` implementation, where it calls `.notify_all` to wake up any sleeping worker threads to drain the queue or see that all the work is complete.
 
 ## Todo
-* Add capacity to detect thread panics and add a new thread to the pool in that event
 * Add doc comments to project
+
+## References
+- *Hands On Concurrency with Rust* by Brian Troutwine
+- [`crossbeam` docs] (https://docs.rs/crossbeam/latest/crossbeam/)

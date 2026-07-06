@@ -1,9 +1,10 @@
 use crossbeam::deque::{Injector, Steal, Stealer, Worker};
 use std::{
-    sync::atomic::AtomicBool,
-    sync::atomic::Ordering,
-    sync::{Arc, Condvar, Mutex},
-    thread::{self, JoinHandle},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle, panicking},
 };
 
 type Task = Box<dyn FnOnce() + Send>;
@@ -19,6 +20,32 @@ struct WorkerContext {
     shutdown: Arc<AtomicBool>,
     mcv: Arc<(Condvar, Mutex<()>)>,
     stack_size: Option<usize>,
+    threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl Drop for WorkerContext {
+    fn drop(&mut self) {
+        if panicking() {
+            println!("[{}] panicked! Spinning up a replacement...", self.id);
+            let replacement = Worker::new_fifo();
+            // drain surviving tasks back into the replacement worker
+            while let Some(task) = self.worker.pop() {
+                replacement.push(task);
+            }
+            let ctx = WorkerContext {
+                global: Arc::clone(&self.global),
+                worker: replacement,
+                stealers: Arc::clone(&self.stealers),
+                id: self.id,
+                shutdown: Arc::clone(&self.shutdown),
+                mcv: Arc::clone(&self.mcv),
+                name: self.name.clone(),
+                stack_size: self.stack_size,
+                threads: Arc::clone(&self.threads),
+            };
+            ThreadPoolBuilder::spawn_in_pool(ctx);
+        }
+    }
 }
 
 fn worker_loop(ctx: WorkerContext) {
@@ -91,7 +118,7 @@ pub struct ThreadPool {
     global: Arc<Injector<Task>>,    // the global queue of work to do
     shutdown: Arc<AtomicBool>,      // a global signal that the threadpool is shutting down
     mcv: Arc<(Condvar, Mutex<()>)>, // signal used for sleeping and waking threads in the pool
-    workers: Vec<JoinHandle<()>>,
+    workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 #[derive(Default, Clone)]
@@ -117,7 +144,8 @@ impl ThreadPoolBuilder {
         self
     }
 
-    fn spawn_in_pool(ctx: WorkerContext) -> thread::JoinHandle<()> {
+    fn spawn_in_pool(ctx: WorkerContext) {
+        let thread_list = Arc::clone(&ctx.threads);
         let mut builder = thread::Builder::new();
         if let Some(ref name) = ctx.name {
             builder = builder.name(name.clone());
@@ -125,17 +153,16 @@ impl ThreadPoolBuilder {
         if let Some(ref stack_size) = ctx.stack_size {
             builder = builder.stack_size(*stack_size);
         }
-        builder
+        let jh = builder
             .spawn(move || worker_loop(ctx))
-            .expect("failed to spawn a fresh thread")
+            .expect("failed to spawn a fresh thread");
+        thread_list.lock().unwrap().push(jh);
     }
 
     pub fn build(self) -> ThreadPool {
         let global = Arc::new(Injector::default());
 
         let num_workers = self.num_threads.unwrap_or_else(num_cpus::get);
-        let mut worker_threads = Vec::with_capacity(num_workers);
-
         // Generate workers list
         let workers: Vec<_> = (0..num_workers)
             .map(|_| Worker::<Task>::new_fifo())
@@ -145,6 +172,7 @@ impl ThreadPoolBuilder {
         let mcv = Arc::new((Condvar::new(), Mutex::new(())));
         // Generate shutdown signal
         let shutdown = Arc::new(AtomicBool::new(false));
+        let threads = Arc::new(Mutex::new(Vec::with_capacity(num_workers)));
 
         for (i, worker) in workers.into_iter().enumerate() {
             println!("Creating Worker {i}...");
@@ -158,16 +186,16 @@ impl ThreadPoolBuilder {
                 mcv: Arc::clone(&mcv),
                 stack_size: self.thread_stack_size,
                 name: self.thread_name.clone(),
+                threads: Arc::clone(&threads),
             };
 
-            let handle = Self::spawn_in_pool(ctx);
-            worker_threads.push(handle);
+            Self::spawn_in_pool(ctx);
         }
         ThreadPool {
             global,
             shutdown,
             mcv,
-            workers: worker_threads,
+            workers: threads,
         }
     }
 }
@@ -197,9 +225,12 @@ impl Drop for ThreadPool {
         println!("Waking up any sleeping threads...");
         self.mcv.0.notify_all();
         drop(_guard);
-        for (i, worker) in self.workers.drain(..).enumerate() {
+        for (i, worker) in self.workers.lock().unwrap().drain(..).enumerate() {
             println!("Waiting on Worker {i}...");
-            worker.join().unwrap();
+            match worker.join() {
+                Ok(_) => {}
+                Err(e) => println!("[{i}] panicked: {:?}", e),
+            }
         }
     }
 }
@@ -243,5 +274,30 @@ mod tests {
             expected as u64 * max_wait
         );
         assert_eq!(*counter.lock().unwrap(), expected);
+    }
+
+    #[test]
+    fn test_thread_replacement_on_panic() {
+        let pool = ThreadPoolBuilder::default().with_threads(2).build();
+
+        let counter = Arc::new(Mutex::new(0));
+
+        // trigger a panic on one worker
+        pool.spawn(|| panic!("intentional panic"));
+
+        // give the replacement thread time to spin up
+        thread::sleep(Duration::from_millis(100));
+
+        // verify the pool is still functional
+        for _ in 0..10 {
+            let counter = Arc::clone(&counter);
+            pool.spawn(move || {
+                let mut n = counter.lock().unwrap();
+                *n += 1;
+            });
+        }
+
+        pool.join();
+        assert_eq!(*counter.lock().unwrap(), 10);
     }
 }
