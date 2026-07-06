@@ -85,40 +85,42 @@ drain remaining tasks and terminate
 - **`name`** / **`stack_size`** — optional configuration set during the build phase
 
 ### Thread Replacement
-Admittedly this approach has some drawbacks, but bear with me. This system spins up a fixed number of threads to which `Task`s get dispatched. I thought to myself "What happens if a thread panics?", we lose that worker capacity. In an effort to address that, Rust offers a slick way to handle it:
+Admittedly this approach has some drawbacks, but bear with me. This system spins up a fixed number of threads to which `Task`s get dispatched. I thought to myself "What happens if a thread panics?". Well, we will lose that worker capacity! In an effort to address that, Rust offers a slick way to handle it:
 ```
 impl Drop for WorkerContext {
     fn drop(&mut self) {
         if panicking() {
-              let replacement = Worker::new_fifo();
-              // drain surviving tasks back into the replacement worker
-              while let Some(task) = self.worker.pop() {
-                  replacement.push(task);
-              }
-              let ctx = WorkerContext {
-                  global: Arc::clone(&self.global),
-                  worker: replacement,
-                  stealers: Arc::clone(&self.stealers),
-                  ...
-              };
-              ThreadPoolBuilder::spawn_in_pool(ctx);
+            // pull an owned version of `worker` from the &mut, dumping a blank one in its place
+            let worker = std::mem::replace(&mut self.worker, Worker::new_fifo());
+
+            let ctx = WorkerContext {
+                global: Arc::clone(&self.global),
+                worker,
+                stealers: Arc::clone(&self.stealers),
+                id: self.id,
+                shutdown: Arc::clone(&self.shutdown),
+                mcv: Arc::clone(&self.mcv),
+                name: self.name.clone(),
+                stack_size: self.stack_size,
+                threads: Arc::clone(&self.threads),
+            };
+            ThreadPoolBuilder::spawn_in_pool(ctx);
         }
     }
 }
 ```
 We can configure our implementation of `Drop` for `WorkerContext`. If a thread panics, it's going to drop the `WorkerContext` that was passed to it. A drop could be totally benign for example if the `ThreadPool` has shutdown, but we can use `std::thread::panicking` to see if this drop was the result of a panic.
 
+- **Jank Glue** - I had to add an `Arc<Mutex<Vec<JoinHandle<()>>>>` to the `WorkerContext` to get this to work. There's definitely a better way, but this gets the job done and contention should be minimal. The lock is only taken in `spawn_in_pool` and `ThreadPool::drop`.
+
 If so, we can quickly set up a replacement worker thread by doing the following:
-1. Create a new `Worker` queue and drain the remaining elements in the current one.
+1. Perform a classic Indiana Jones move and steal the `Worker` queue from the old context using `std::mem::replace`.
 2. Copy all the other data from the old context into a fresh one
 3. Spin up a new worker thread with this context.
 
-- **Jank Glue** - I had to add an `Arc<Mutex<Vec<JoinHandle<()>>>>` to the `WorkerContext` to get this to work. There's definitely a better way, but this gets the job done and contention should be minimal. The lock is only taken in `spawn_in_pool` and `ThreadPool::drop`.
+Let's take a minute to appreciate the elegance here. Because we stole the old context's `Worker` queue, the associate `Stealer` queue still has access to it. We just performed a 1-for-1 thread swap and we didn't lose any work from the backlog or the ability for other threads to steal from our queue.
 
-You may notice another problem here. We didn't append to the `stealers` queue. Our new thread will be able to steal from others, but nobody will be able to steal from it. Because we hold `stealers` in a normal `Vec`, it's immutable. There are a few possibilities for addressing this:
-
-1. Accept the limitation (what I chose to do)
-2. Protect `stealers` with a `RwLock`. This comes with the risk of high-contention and cache coherency slow down.
+This is triggered completely transparently when `WorkerContext` drops, it just does it without the user having to do anything.
 
 ## Required Equipment
 [`crossbeam::deque`](https://docs.rs/crossbeam/latest/crossbeam/deque/index.html) gives us some nifty tools to tackle this challenge. This `deque` comes in three flavors for us: `Injector`, `Worker`, and `Stealer`.
@@ -212,4 +214,4 @@ This issue also applied to `ThreadPool`'s `Drop` implementation, where it calls 
 
 ## References
 - *Hands On Concurrency with Rust* by Brian Troutwine
-- [`crossbeam` docs] (https://docs.rs/crossbeam/latest/crossbeam/)
+- [`crossbeam` docs](https://docs.rs/crossbeam/latest/crossbeam/)

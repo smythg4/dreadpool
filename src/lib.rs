@@ -27,14 +27,13 @@ impl Drop for WorkerContext {
     fn drop(&mut self) {
         if panicking() {
             println!("[{}] panicked! Spinning up a replacement...", self.id);
-            let replacement = Worker::new_fifo();
-            // drain surviving tasks back into the replacement worker
-            while let Some(task) = self.worker.pop() {
-                replacement.push(task);
-            }
+
+            // pull an owned version of `worker` from the &mut, dumping a blank one in its place
+            let worker = std::mem::replace(&mut self.worker, Worker::new_fifo());
+
             let ctx = WorkerContext {
                 global: Arc::clone(&self.global),
-                worker: replacement,
+                worker,
                 stealers: Arc::clone(&self.stealers),
                 id: self.id,
                 shutdown: Arc::clone(&self.shutdown),
