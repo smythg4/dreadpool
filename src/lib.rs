@@ -7,10 +7,13 @@ use std::{
     thread::{self, JoinHandle, panicking},
 };
 
+/// The unit of work for the `ThreadPool`. `Tasks` are scheduled using `ThreadPool::spawn`
+/// and placed in a global queue managed by the `ThreadPool`
 type Task = Box<dyn FnOnce() + Send>;
 
 const IDEAL_WORKER_BACKLOG: usize = 10; // completely arbitrary choice
 
+/// Holds the information that worker threads need to operate independently.
 struct WorkerContext {
     name: Option<String>,
     global: Arc<Injector<Task>>,
@@ -23,6 +26,7 @@ struct WorkerContext {
     threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
+/// In the event of a `drop` due to panic, we will spin up a replacement thread for the pool
 impl Drop for WorkerContext {
     fn drop(&mut self) {
         if panicking() {
@@ -47,6 +51,7 @@ impl Drop for WorkerContext {
     }
 }
 
+/// Worker threads run an infinite loop until being notified by the `ThreadPool` that it's time to shutdown.
 fn worker_loop(ctx: WorkerContext) {
     let id = ctx.id;
     loop {
@@ -113,6 +118,9 @@ fn worker_loop(ctx: WorkerContext) {
     }
 }
 
+/// Holds a reference to a global `Task` queue, a flag to indicate shutdown to worker threads,
+/// a `CondVar` and associated `Mutex` for thread sleep control, and a protected list
+/// of all worker thread `JoinHandles`
 pub struct ThreadPool {
     global: Arc<Injector<Task>>,    // the global queue of work to do
     shutdown: Arc<AtomicBool>,      // a global signal that the threadpool is shutting down
@@ -120,6 +128,8 @@ pub struct ThreadPool {
     workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
+/// Used to generate a configured `ThreadPool` by calling `.build()`. Caller can specify
+/// number of threads for the pool, a name for logging purposes, and a preferred thread stack size.
 #[derive(Default, Clone)]
 pub struct ThreadPoolBuilder {
     num_threads: Option<usize>,
@@ -128,16 +138,26 @@ pub struct ThreadPoolBuilder {
 }
 
 impl ThreadPoolBuilder {
+    /// Used to select the number of threads you want your `ThreadPool` to manage.
+    /// Defaults to the number of logical CPUs if not specified.
+    ///
+    /// # Examples
+    /// ```
+    /// use dreadpool::ThreadPoolBuilder;
+    /// let pool = ThreadPoolBuilder::default().with_threads(4).build();
+    /// ```
     pub fn with_threads(mut self, num_threads: usize) -> Self {
         self.num_threads = Some(num_threads);
         self
     }
 
+    /// Used to give your pool a name for logging purposes.
     pub fn with_thread_name<S: Into<String>>(mut self, name: S) -> Self {
         self.thread_name = Some(name.into());
         self
     }
 
+    /// Used to specify desired stack size for your worker threads.
     pub fn with_stack_size(mut self, stack_size: usize) -> Self {
         self.thread_stack_size = Some(stack_size);
         self
@@ -158,6 +178,7 @@ impl ThreadPoolBuilder {
         thread_list.lock().unwrap().push(jh);
     }
 
+    /// Generates a `ThreadPool` with settings specified by the `ThreadPoolBuilder`
     pub fn build(self) -> ThreadPool {
         let global = Arc::new(Injector::default());
 
@@ -200,10 +221,36 @@ impl ThreadPoolBuilder {
 }
 
 impl ThreadPool {
+    /// Returns a blank `ThreadPoolBuilder`
+    ///
+    /// # Examples
+    /// ```
+    /// use dreadpool::ThreadPool;
+    /// let pool = ThreadPool::builder()
+    ///     .with_threads(4)
+    ///     .build();
+    ///
     pub fn builder() -> ThreadPoolBuilder {
         ThreadPoolBuilder::default()
     }
 
+    /// Takes a closure, converts it to a `Task` and puts it in the `ThreadPool`'s global queue
+    /// for assignment. Calling `spawn` will wake up a single sleeping worker thread if one exists.
+    ///
+    /// # Examples
+    /// ```
+    /// use dreadpool::ThreadPool;
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// let pool = ThreadPool::builder().with_threads(2).build();
+    /// let counter = Arc::new(Mutex::new(0));
+    /// let c = Arc::clone(&counter);
+    /// pool.spawn(move || {
+    ///     *c.lock().unwrap() += 1;
+    /// });
+    /// pool.join();
+    /// assert_eq!(*counter.lock().unwrap(), 1);
+    /// `
     pub fn spawn(&self, f: impl FnOnce() + Send + 'static) {
         let _guard = self.mcv.1.lock().unwrap();
         self.global.push(Box::new(f));
@@ -211,6 +258,22 @@ impl ThreadPool {
         self.mcv.0.notify_one();
     }
 
+    /// Blocks until all spawned tasks complete, then shuts down the pool.
+    ///
+    /// # Examples
+    /// ```
+    /// use dreadpool::ThreadPool;
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// let pool = ThreadPool::builder().with_threads(2).build();
+    /// let counter = Arc::new(Mutex::new(0));
+    /// for _ in 0..10 {
+    ///     let c = Arc::clone(&counter);
+    ///     pool.spawn(move || *c.lock().unwrap() += 1);
+    /// }
+    /// pool.join();
+    /// assert_eq!(*counter.lock().unwrap(), 10);
+    /// ```
     pub fn join(self) {
         drop(self)
     }
