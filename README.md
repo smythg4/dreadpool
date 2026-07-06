@@ -211,6 +211,12 @@ We hold the `Mutex` guard across the global queue and `shutdown` checks to preve
 ```
 This issue also applied to `ThreadPool`'s `Drop` implementation, where it calls `.notify_all` to wake up any sleeping worker threads to drain the queue or see that all the work is complete.
 
+## Next Steps
+- Deep dive into Chase-Lev queues that back `crossbeam::Deque`.
+- Deep dive into `tokio`'s work stealing algorithm/approach.
+- Build another iteration of this with zero-dependencies.
+- Benchmark my implementation against `crossbeam`.
+
 ## References
 - *Hands On Concurrency with Rust* by Brian Troutwine
 - [`crossbeam` docs](https://docs.rs/crossbeam/latest/crossbeam/)
