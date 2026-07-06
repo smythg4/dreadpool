@@ -111,7 +111,9 @@ impl Drop for WorkerContext {
 ```
 We can configure our implementation of `Drop` for `WorkerContext`. If a thread panics, it's going to drop the `WorkerContext` that was passed to it. A drop could be totally benign for example if the `ThreadPool` has shutdown, but we can use `std::thread::panicking` to see if this drop was the result of a panic.
 
-**Jank Glue** - I had to add an `Arc<Mutex<Vec<JoinHandle<()>>>>` to the `WorkerContext` to get this to work. There's definitely a better way, but this gets the job done and contention should be minimal. The lock is only taken in `spawn_in_pool` and `ThreadPool::drop`.
+> **Jank Note** - I had to add an `Arc<Mutex<Vec<JoinHandle<()>>>>` to the `WorkerContext` to get this to work. There's
+> definitely a better way, but this gets the job done and contention should be minimal. The lock is only taken in 
+> `spawn_in_pool` and `ThreadPool::drop`.
 
 If so, we can quickly set up a replacement worker thread by doing the following:
 1. Perform a classic Indiana Jones move and swap the `Worker` queue from the old context with a blank replacement using `std::mem::replace`.
