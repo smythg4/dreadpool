@@ -301,7 +301,7 @@ impl Drop for ThreadPool {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{self, Duration};
 
     #[test]
     fn test_tasks_execute() {
@@ -367,5 +367,43 @@ mod tests {
 
         pool.join();
         assert_eq!(*counter.lock().unwrap(), 10);
+    }
+
+    fn fib(n: usize) -> usize {
+        if n == 1 || n == 0 {
+            return 1;
+        }
+        fib(n - 1) + fib(n - 2)
+    }
+
+    #[test]
+    fn test_fib() {
+        // establish a baseline for singlethreaded fib compute time.
+        let start = time::Instant::now();
+        let answer = fib(42);
+        let baseline = start.elapsed();
+
+        let num_threads = num_cpus::get();
+        let num_tasks = num_threads * 3;
+
+        let pool = ThreadPoolBuilder::default()
+            .with_threads(num_threads)
+            .build();
+
+        // hand out fibs to the threadpool
+        let thread_start = time::Instant::now();
+        for i in 0..num_tasks {
+            pool.spawn(move || {
+                let n = fib(42);
+                assert_eq!(n, answer);
+                println!("[{i}]: {n}");
+            });
+        }
+        pool.join();
+        let thread_end = thread_start.elapsed();
+        println!(
+            "Single thread took: {baseline:?}. Threadpool took {thread_end:?} for {num_tasks} runs"
+        );
+        assert!(thread_end < baseline * num_tasks as u32);
     }
 }
